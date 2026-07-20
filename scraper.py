@@ -15,6 +15,8 @@ import re
 import json
 import os
 import time
+import random
+import html as html_lib
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -25,16 +27,37 @@ BASE_URL = "https://www.gollo.com/c"
 PAGE_SIZE = 36           # productos por página (el máximo que ofrece el sitio)
 MIN_DISCOUNT = 50        # % mínimo de descuento para alertar
 STATE_FILE = "state.json"
-REQUEST_DELAY = 1.2      # segundos entre requests, para no golpear el sitio
+REQUEST_DELAY = 2.5      # segundos base entre requests, para no golpear el sitio
 MAX_PAGES = 100          # tope de seguridad
 TIMEOUT = 30
+MAX_RETRIES = 4          # reintentos por página si nos bloquean (429) o hay error
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-CR,es;q=0.9,en;q=0.8",
+    "Referer": "https://www.gollo.com/",
+    "Connection": "keep-alive",
 }
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
+# Patrones para extraer info directamente del HTML crudo, en una "ventana" de
+# texto alrededor de cada link de producto. Esto es más robusto que depender
+# de la profundidad exacta del árbol DOM (que puede variar).
+LINK_RE = re.compile(r'<a\b[^>]*?href="([^"]+?/p)"[^>]*>', re.IGNORECASE)
+TITLE_RE = re.compile(r'title="([^"]*)"', re.IGNORECASE)
+PRICE_RE = re.compile(r'₡\s?[\d.,]+')
+DISCOUNT_RE = re.compile(r'(\d{1,3})\s?%')
+TAG_RE = re.compile(r'<[^>]+>')
+WS_RE = re.compile(r'\s+')
+
+WINDOW_BEFORE = 400
+WINDOW_AFTER = 2500
 
 # ------------------------------- Utilidades --------------------------------
 
@@ -44,6 +67,13 @@ def parse_price(text):
     cleaned = text.replace("₡", "").replace(".", "").replace(",", "").strip()
     m = re.search(r"\d+", cleaned)
     return int(m.group()) if m else None
+
+
+def clean_text(raw_html_fragment):
+    text = TAG_RE.sub(" ", raw_html_fragment)
+    text = html_lib.unescape(text)
+    text = WS_RE.sub(" ", text).strip()
+    return text
 
 
 def get_total_pages(soup):
@@ -58,45 +88,36 @@ def get_total_pages(soup):
 
 def extract_products_from_page(html):
     """
-    Extrae productos de una página de listado.
-    Estrategia: todos los links de producto en Gollo terminan en '/p'.
-    Para cada uno, se sube por el árbol DOM hasta encontrar el contenedor
-    de la tarjeta (el que tiene el precio y el % de descuento) y de ahí
-    se extrae todo por texto/regex. Esto es más robusto que depender de
-    nombres de clases CSS que Gollo puede cambiar con el tiempo.
+    Extrae productos buscando cada link que termina en '/p' (así son todas
+    las URLs de producto en Gollo) y mirando el texto que aparece justo
+    alrededor de ese link en el HTML crudo (antes y después), sin depender
+    de nombres de clases CSS ni de la estructura exacta del árbol DOM.
     """
-    soup = BeautifulSoup(html, "html.parser")
-    products = []
-    seen = set()
+    products = {}
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not href.rstrip("/").endswith("/p"):
-            continue
-        if href in seen:
-            continue
-        seen.add(href)
-
-        container = a
-        card_text = None
-        for _ in range(6):
-            if container.parent is None:
-                break
-            container = container.parent
-            text = container.get_text(" ", strip=True)
-            if "₡" in text and "%" in text:
-                card_text = text
-                break
-
-        if not card_text:
+    for m in LINK_RE.finditer(html):
+        href = m.group(1)
+        if href in products:
             continue
 
-        name = a.get("title") or a.get_text(strip=True)
+        tag_text = m.group(0)
+        title_match = TITLE_RE.search(tag_text)
+        name = html_lib.unescape(title_match.group(1)).strip() if title_match else None
+
+        window_start = max(0, m.start() - WINDOW_BEFORE)
+        window_end = min(len(html), m.end() + WINDOW_AFTER)
+        window_html = html[window_start:window_end]
+        window_text = clean_text(window_html)
+
+        if not name:
+            after_text = clean_text(html[m.end():m.end() + 200])
+            name = after_text[:120].strip() if after_text else None
+
         if not name:
             continue
 
-        prices = re.findall(r"₡\s?[\d.,]+", card_text)
-        discount_match = re.search(r"(\d{1,3})\s?%", card_text)
+        prices = PRICE_RE.findall(window_text)
+        discount_match = DISCOUNT_RE.search(window_text)
 
         if len(prices) < 2 or not discount_match:
             continue
@@ -109,23 +130,51 @@ def extract_products_from_page(html):
             continue
 
         computed_discount = round((1 - special_price / regular_price) * 100)
+        if abs(discount - computed_discount) > 15:
+            discount = computed_discount
 
-        products.append({
-            "name": name.strip(),
-            "url": href if href.startswith("http") else f"https://www.gollo.com{href}",
+        full_url = href if href.startswith("http") else f"https://www.gollo.com{href}"
+
+        products[href] = {
+            "name": name,
+            "url": full_url,
             "special_price": special_price,
             "regular_price": regular_price,
-            "discount": max(discount, computed_discount),
-        })
+            "discount": discount,
+        }
 
-    return products
+    return list(products.values())
 
 
 def fetch_page(page_num):
     params = {"p": page_num, "product_list_limit": PAGE_SIZE}
-    resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=TIMEOUT)
-    resp.raise_for_status()
-    return resp.text
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = session.get(BASE_URL, params=params, timeout=TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            wait = 5 * attempt
+            print(f"[warn] Fallo de red en pagina {page_num} (intento {attempt}): {e}. Esperando {wait}s...")
+            time.sleep(wait)
+            continue
+
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            wait = int(retry_after) if retry_after and retry_after.isdigit() else 8 * attempt
+            print(f"[warn] 429 en pagina {page_num} (intento {attempt}). Esperando {wait}s...")
+            time.sleep(wait)
+            continue
+
+        if resp.status_code >= 500:
+            wait = 5 * attempt
+            print(f"[warn] Error {resp.status_code} en pagina {page_num} (intento {attempt}). Esperando {wait}s...")
+            time.sleep(wait)
+            continue
+
+        resp.raise_for_status()
+        return resp.text
+
+    raise RuntimeError(f"No se pudo obtener la pagina {page_num} tras {MAX_RETRIES} intentos")
 
 
 def scrape_all_products():
@@ -138,16 +187,22 @@ def scrape_all_products():
 
     for prod in extract_products_from_page(first_html):
         all_products[prod["url"]] = prod
+    print(f"[info] Pagina 1/{total_pages}: {len(all_products)} productos acumulados")
 
     for page in range(2, total_pages + 1):
+        time.sleep(REQUEST_DELAY + random.uniform(0, 1.0))
         try:
             html = fetch_page(page)
         except Exception as e:
-            print(f"[warn] Error en pagina {page}: {e}")
+            print(f"[warn] Se omite pagina {page} tras varios intentos: {e}")
             continue
-        for prod in extract_products_from_page(html):
+
+        found = extract_products_from_page(html)
+        for prod in found:
             all_products[prod["url"]] = prod
-        time.sleep(REQUEST_DELAY)
+
+        if page % 10 == 0 or page == total_pages:
+            print(f"[info] Pagina {page}/{total_pages}: {len(all_products)} productos acumulados")
 
     return list(all_products.values())
 
@@ -233,8 +288,6 @@ def main():
     else:
         print("[info] No hay ofertas nuevas que alertar")
 
-    # Solo se mantienen en "alertados" las que siguen activas como oferta.
-    # Si una oferta desaparece y vuelve a aparecer despues, se vuelve a alertar.
     current_deal_urls = {p["url"] for p in deals}
     alerted = (alerted & current_deal_urls) | {p["url"] for p in new_deals}
 
