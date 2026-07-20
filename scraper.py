@@ -25,7 +25,7 @@ from email.mime.multipart import MIMEMultipart
 
 BASE_URL = "https://www.gollo.com/c"
 PAGE_SIZE = 36           # productos por página (el máximo que ofrece el sitio)
-MIN_DISCOUNT = 50        # % mínimo de descuento para alertar
+MIN_DISCOUNT = 71        # % mínimo de descuento para alertar
 STATE_FILE = "state.json"
 REQUEST_DELAY = 2.5      # segundos base entre requests, para no golpear el sitio
 MAX_PAGES = 100          # tope de seguridad
